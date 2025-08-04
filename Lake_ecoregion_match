@@ -1,0 +1,192 @@
+
+
+"""
+判断湖泊在哪个生态区内 - 第一步：完全包含
+"""
+import geopandas as gpd
+import pandas as pd
+import os
+from tqdm import tqdm
+
+# 参数设置
+hydrolake_path = r'G:\ren\CBR\GLAKES\natural_lakes.gpkg'
+ecoregion_path = r'G:\ren\CBR\Ecoregions\ecoregions_dissolved_by_biome.shp'
+output_dir = r'G:\ren\湖泊生态区统计\hydrolake_ecoregionbatches'
+remain_dir = os.path.join(output_dir, 'lake_remain')
+chunk_size = 10000
+start_batch = 0  # ✅ 修改为你希望开始运行的批次编号
+
+# 创建输出文件夹
+os.makedirs(output_dir, exist_ok=True)
+os.makedirs(remain_dir, exist_ok=True)
+
+# 读取数据
+gdf_lakes = gpd.read_file(hydrolake_path)
+gdf_regions = gpd.read_file(ecoregion_path)
+gdf_regions = gdf_regions.to_crs(gdf_lakes.crs)
+
+# 检查湖泊图层中是否存在 Area_bound 字段
+if 'Area_bound' not in gdf_lakes.columns:
+    raise ValueError("字段 'Area_bound' 不存在于 natural_lakes.gpkg 中，请确认其来源正确。")
+
+# 分批处理
+chunks = [gdf_lakes.iloc[i:i+chunk_size] for i in range(0, len(gdf_lakes), chunk_size)]
+total_batches = len(chunks)
+
+# 存储未匹配湖泊
+remain_list = []
+
+# 顺序处理每一批
+for idx in tqdm(range(start_batch, total_batches), desc="处理进度"):
+    chunk = chunks[idx].copy()
+    print(f"🔹 正在处理第 {idx+1}/{total_batches} 批...")
+
+    # 空间连接（湖泊在生态区内）
+    joined = gpd.sjoin(chunk, gdf_regions[['BIOME_NAME', 'geometry']],
+                       how='left', predicate='within')
+
+    # 匹配成功
+    matched = joined[~joined['BIOME_NAME'].isna()]
+    out_path = os.path.join(output_dir, f"lake_batch_{idx+1:05}.xlsx")
+    matched[['Lake_id', 'BIOME_NAME', 'Area_PW', 'Area_bound']].to_excel(out_path, index=False)
+
+    # 匹配失败
+    remain_chunk = chunk[joined['BIOME_NAME'].isna()]
+    if not remain_chunk.empty:
+        remain_list.append(remain_chunk)
+
+# 合并剩余湖泊并输出
+if remain_list:
+    remain_gdf = pd.concat(remain_list).drop_duplicates(subset='Lake_id')
+    remain_gdf = gpd.GeoDataFrame(remain_gdf, geometry='geometry', crs=gdf_lakes.crs)
+    remain_path = os.path.join(remain_dir, 'remain.shp')
+    remain_gdf.to_file(remain_path)
+    print(f"❗ 未被完全包含的湖泊已保存至：{remain_path}")
+
+print("✅ 所有批次处理完成！")
+"""
+判断湖泊在哪个生态区内 第3步 与多个生态区相交时 计算面积占比 取最大的作为湖泊生态区
+"""
+
+
+import geopandas as gpd
+import pandas as pd
+import os
+import math
+
+# ========== 路径设置 ==========
+hydrolake_path = r'G:\ren\湖泊生态区统计\hydrolake_ecoregionbatches\lake_remain\lake_remain2\remain2.shp'
+ecoregion_path = r'G:\ren\CBR\Ecoregions\ecoregions_dissolved_by_biome.shp'
+output_dir = r'G:\ren\湖泊生态区统计\hydrolake_ecoregionbatches\lake_remain\lakeremain3'
+
+os.makedirs(output_dir, exist_ok=True)
+
+# ========== 读取数据 ==========
+lakes_all = gpd.read_file(hydrolake_path)
+ecoregions = gpd.read_file(ecoregion_path)
+
+# ========== 投影统一（北极投影） ==========
+target_crs = 'EPSG:3395'
+lakes_all = lakes_all.to_crs(target_crs)
+ecoregions = ecoregions.to_crs(target_crs)
+
+
+# ========== 分批处理 ==========
+batch_size = 20
+num_batches = math.ceil(len(lakes_all) / batch_size)
+
+for i in range(num_batches):
+    print(f"🔄 正在处理第 {i + 1} 批 / 共 {num_batches} 批...")
+
+    lakes_batch = lakes_all.iloc[i * batch_size:(i + 1) * batch_size].copy()
+
+    # 交集计算
+    intersections = gpd.overlay(lakes_batch, ecoregions, how='intersection')
+    intersections['intersect_area_m2'] = intersections.geometry.area
+
+    # 按最大交面积选择生态区
+    intersections = intersections.sort_values('intersect_area_m2', ascending=False).drop_duplicates('Lake_id')
+
+    # 提取生态区字段
+    ecoregion_cols = [col for col in intersections.columns if col not in lakes_batch.columns and col not in ['geometry', 'intersect_area_m2']]
+    intersections_df = intersections[['Lake_id', 'intersect_area_m2'] + ecoregion_cols]
+
+    # 合并属性
+    lakes_batch_df = lakes_batch.drop(columns='geometry')
+    matched = pd.merge(lakes_batch_df, intersections_df, on='Lake_id', how='left')
+
+    # 拆分匹配和未匹配
+    matched_valid = matched[matched['intersect_area_m2'].notna()]
+    unmatched_ids = matched[matched['intersect_area_m2'].isna()]['Lake_id']
+    unmatched_gdf = lakes_batch[lakes_batch['Lake_id'].isin(unmatched_ids)]
+
+    # 输出 Excel
+    excel_out = os.path.join(output_dir, f'batch_{i + 1}_matched.xlsx')
+    matched_valid.to_excel(excel_out, index=False)
+
+    # 输出未匹配 Shapefile
+    if not unmatched_gdf.empty:
+        shp_out = os.path.join(output_dir, f'batch_{i + 1}_remain_unmatched.shp')
+        unmatched_gdf.to_file(shp_out)
+
+    print(f"✅ 批次 {i + 1} 处理完成，匹配数: {len(matched_valid)}，未匹配数: {len(unmatched_gdf)}")
+
+print("🎉 所有批次处理完成！")
+
+"""
+第四步：距离判断法（含 remain.shp 输出）
+"""
+import geopandas as gpd
+import pandas as pd
+from tqdm import tqdm
+from shapely.ops import nearest_points
+
+# ========= 路径 =========
+lake_path   = r'G:\ren\湖泊生态区统计\hydrolake_ecoregionbatches\lake_remain\lakeremain3\remain3.shp'
+eco_path    = r'G:\ren\CBR\Ecoregions\ecoregions_dissolved_by_biome.shp'
+out_csv     = r'G:\ren\湖泊生态区统计\hydrolake_ecoregionbatches\lake_remain\lakeremain3\lake_remain_assigned_by_distance.csv'
+remain_path = r'G:\ren\湖泊生态区统计\hydrolake_ecoregionbatches\lake_remain\lakeremain3\remain4.shp'
+
+# ========= 读数 & 投影 =========
+lakes       = gpd.read_file(lake_path).to_crs(epsg=4087)          # World Equidistant Cylindrical
+ecoregions  = gpd.read_file(eco_path).to_crs(epsg=4087)
+
+# ========= 结果容器 =========
+assigned_rows   = []          # 最终属性表
+remain_lakes    = []          # 仅“距离匹配”湖泊
+
+# ========= 主循环 =========
+for idx, lake in tqdm(lakes.iterrows(), total=len(lakes), desc='Assigning ecoregions'):
+    lake_geom = lake.geometry
+    
+    # ① 尝试“相交”匹配
+    intersected = ecoregions[ecoregions.intersects(lake_geom)]
+    
+    if not intersected.empty:
+        chosen_eco = intersected.iloc[0]          # 多个时可改为面积最大等策略
+    else:
+        # ② 距离匹配，并记录到 remain_lakes
+        ecoregions['distance'] = ecoregions.geometry.boundary.distance(lake_geom)
+        chosen_eco  = ecoregions.loc[ecoregions['distance'].idxmin()]
+        remain_lakes.append(lake)                 # 仅“距离匹配”的湖泊
+    
+    # ==== 合并属性（保留湖泊字段 + 生态区字段）====
+    merged_record = lake.drop(labels='geometry').copy()
+    for col in ecoregions.columns:
+        if col != 'geometry':
+            merged_record[f'eco_{col}'] = chosen_eco[col]
+    assigned_rows.append(merged_record)
+
+# ========= 输出属性 CSV =========
+pd.DataFrame(assigned_rows).to_csv(out_csv, index=False, encoding='utf-8-sig')
+print(f"✅ 属性结果已保存：{out_csv}")
+
+# ========= 输出 remain.shp =========
+if remain_lakes:
+    gpd.GeoDataFrame(remain_lakes, crs=lakes.crs).to_file(remain_path)
+    print(f"✅ 通过“距离匹配”的湖泊已输出：{remain_path}")
+else:
+    print("🎉 没有湖泊通过距离才被匹配，remain.shp 未生成。")
+
+
+
