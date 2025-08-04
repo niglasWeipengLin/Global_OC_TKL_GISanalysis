@@ -1,0 +1,141 @@
+"""
+1
+"""
+
+import geopandas as gpd
+import pandas as pd
+import os
+from concurrent.futures import ThreadPoolExecutor
+
+# 文件路径
+hydrolake_path = r'D:\ren\CBR\GLAKES\PolarGlakes\GlakesInPolar.shp'
+ecoregion_path = r'D:\ren\CBR\Permafrost Zonation (PERZONES) is provided as ESRI shapefile\Polar_Permafrost.shp'
+
+# 输出路径
+output_dir = r'D:\ren\湖泊生态区统计\PolarGlakesPermafrost_batches'
+remain_dir = os.path.join(output_dir, 'Polar_lake_remain')
+os.makedirs(output_dir, exist_ok=True)
+os.makedirs(remain_dir, exist_ok=True)
+
+# 读取数据
+gdf_lakes = gpd.read_file(hydrolake_path)
+gdf_regions = gpd.read_file(ecoregion_path).to_crs(gdf_lakes.crs)
+
+# 分批数据
+chunk_size = 10000
+chunks = [(i, gdf_lakes.iloc[i:i+chunk_size].copy()) for i in range(0, len(gdf_lakes), chunk_size)]
+
+def process_chunk(idx, chunk):
+    print(f"🔧 正在处理第 {idx+1}/{len(chunks)} 批...")
+
+    # 完全包含
+    within_join = gpd.sjoin(chunk, gdf_regions, how='left', predicate='within')
+    within_matched = within_join[~within_join['GRIDCODE'].isna()]
+    within_ids = within_matched['Lake_id'].unique()
+
+    # 相交
+    intersects_join = gpd.sjoin(chunk, gdf_regions, how='left', predicate='intersects')
+    intersects_counts = intersects_join.groupby('Lake_id').size()
+    single_intersect_ids = intersects_counts[intersects_counts == 1].index
+
+    # 合并保留湖泊
+    keep_ids = set(within_ids).union(set(single_intersect_ids))
+    keep_lakes = chunk[chunk['Lake_id'].isin(keep_ids)]
+
+    # 输出 Excel
+    joined_for_output = gpd.sjoin(keep_lakes, gdf_regions, how='left', predicate='intersects')
+    excel_path = os.path.join(output_dir, f"lake_batch_{idx+1:05}.xlsx")
+    joined_for_output[['Lake_id', 'GRIDCODE', 'Area_PW','Area_bound']].drop_duplicates().to_excel(excel_path, index=False)
+
+    # 输出 remain shapefile
+    remain_chunk = chunk[~chunk['Lake_id'].isin(keep_ids)]
+    if not remain_chunk.empty:
+        remain_gdf = gpd.GeoDataFrame(remain_chunk, geometry='geometry', crs=gdf_lakes.crs)
+        remain_path = os.path.join(remain_dir, f"lake_batch_{idx+1:05}_remain.shp")
+        remain_gdf.to_file(remain_path)
+
+    print(f"✅ 第 {idx+1} 批完成。")
+
+# 多线程执行
+with ThreadPoolExecutor(max_workers=8) as executor:
+    executor.map(lambda args: process_chunk(*args), chunks)
+
+print("🎉 所有批次处理完成！")
+
+
+
+"""
+2
+"""
+"""
+2
+"""
+
+import geopandas as gpd
+import pandas as pd
+import os
+import math
+
+# ========== 路径设置 ==========
+hydrolake_path = r'G:\ren\湖泊生态区统计\湖泊生态区统计\PolarGlakesPermafrost_batches\Polar_lake_remain\remain.shp'
+ecoregion_path = r'G:\ren\CBR\Permafrost Zonation (PERZONES) is provided as ESRI shapefile\Polar_Permafrost.shp'
+output_dir = r'G:\ren\湖泊生态区统计\湖泊生态区统计\PolarGlakesPermafrost_batches\PolarthermlakePermafrost_batches2'
+
+os.makedirs(output_dir, exist_ok=True)
+
+# ========== 读取数据 ==========
+lakes_all = gpd.read_file(hydrolake_path)
+ecoregions = gpd.read_file(ecoregion_path)
+
+# ========== 投影统一（北极投影） ==========
+target_crs = 'EPSG:3995'
+lakes_all = lakes_all.to_crs(target_crs)
+ecoregions = ecoregions.to_crs(target_crs)
+
+# ========== 检查 ID 字段 ==========
+
+
+# ========== 分批处理 ==========
+batch_size = 200
+num_batches = math.ceil(len(lakes_all) / batch_size)
+
+for i in range(num_batches):
+    print(f"🔄 正在处理第 {i + 1} 批 / 共 {num_batches} 批...")
+
+    lakes_batch = lakes_all.iloc[i * batch_size:(i + 1) * batch_size].copy()
+
+    # 交集计算
+    intersections = gpd.overlay(lakes_batch, ecoregions, how='intersection')
+    intersections['intersect_area_m2'] = intersections.geometry.area
+
+    # 按最大交面积选择生态区
+    intersections = intersections.sort_values('intersect_area_m2', ascending=False).drop_duplicates('Lake_id')
+
+    # 提取生态区字段
+    ecoregion_cols = [col for col in intersections.columns if col not in lakes_batch.columns and col not in ['geometry', 'intersect_area_m2']]
+    intersections_df = intersections[['Lake_id', 'intersect_area_m2'] + ecoregion_cols]
+
+    # 合并属性
+    lakes_batch_df = lakes_batch.drop(columns='geometry')
+    matched = pd.merge(lakes_batch_df, intersections_df, on='Lake_id', how='left')
+
+    # 拆分匹配和未匹配
+    matched_valid = matched[matched['intersect_area_m2'].notna()]
+    unmatched_ids = matched[matched['intersect_area_m2'].isna()]['Lake_id']
+    unmatched_gdf = lakes_batch[lakes_batch['Lake_id'].isin(unmatched_ids)]
+
+    # 输出 Excel
+    excel_out = os.path.join(output_dir, f'batch_{i + 1}_matched.xlsx')
+    matched_valid.to_excel(excel_out, index=False)
+
+    # 输出未匹配 Shapefile
+    if not unmatched_gdf.empty:
+        shp_out = os.path.join(output_dir, f'batch_{i + 1}_remain_unmatched.shp')
+        unmatched_gdf.to_file(shp_out)
+
+    print(f"✅ 批次 {i + 1} 处理完成，匹配数: {len(matched_valid)}，未匹配数: {len(unmatched_gdf)}")
+
+print("🎉 所有批次处理完成！")
+
+
+
